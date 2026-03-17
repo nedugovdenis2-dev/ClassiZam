@@ -1,0 +1,5 @@
+{
+  "name": "ClassiZam",
+  "description": "Identify classical music instantly. Add your tracks to the local database and start recognizing.",
+  "requestFramePermissions": ["microphone"]
+}
