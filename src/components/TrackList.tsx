@@ -1,9 +1,11 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, type MouseEvent } from 'react';
 import { useStore } from '../store';
 import { Trash2, Music, Play, Square } from 'lucide-react';
 
 export function TrackList() {
-  const { tracks, clearTracks, removeTrack } = useStore();
+  const tracks = useStore(store => store.tracks);
+  const clearTracks = useStore(store => store.clearTracks);
+  const removeTrack = useStore(store => store.removeTrack);
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -54,7 +56,7 @@ export function TrackList() {
     }
   };
 
-  const handleDelete = (e: React.MouseEvent, trackId: string) => {
+  const handleDelete = (e: MouseEvent, trackId: string) => {
     e.stopPropagation();
     if (playingId === trackId) {
       audioRef.current?.pause();

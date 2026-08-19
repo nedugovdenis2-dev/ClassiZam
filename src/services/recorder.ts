@@ -66,10 +66,18 @@ export class AudioRecorder {
   }
 
   stop() {
+    if (this.processor) this.processor.onaudioprocess = null;
     this.stream?.getTracks().forEach(t => t.stop());
     this.processor?.disconnect();
     this.analyser?.disconnect();
     this.source?.disconnect();
-    this.ctx?.close();
+    if (this.ctx && this.ctx.state !== 'closed') {
+      void this.ctx.close().catch(err => console.warn('Failed to close AudioContext', err));
+    }
+    this.processor = null;
+    this.analyser = null;
+    this.source = null;
+    this.stream = null;
+    this.ctx = null;
   }
 }

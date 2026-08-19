@@ -1,10 +1,15 @@
 import { create } from 'zustand';
 import { Track, getTracks, saveTrack, removeTrack as removeTrackDb, clearDb } from './services/db';
-import { getAudioBuffer, extractPeaks, generateHashes, applyPreEmphasis, normalize, resampleAudio } from './services/fingerprint';
+import { AudioImportError, getAudioBuffer, extractPeaks, generateHashes, applyPreEmphasis, normalize, resampleAudio, validateAudioFileForImport } from './services/fingerprint';
 import { saveHashesWorker, removeHashesWorker, clearHashesWorker } from './services/matcher';
 import { get, set as setDb } from 'idb-keyval';
 
 export type AppState = 'IDLE' | 'RECORDING' | 'ANALYZING' | 'MATCH_FOUND' | 'NO_MATCH' | 'ERROR';
+
+export interface AddTrackResult {
+  ok: boolean;
+  error?: string;
+}
 
 interface Store {
   state: AppState;
@@ -17,7 +22,7 @@ interface Store {
   errorMessage: string | null;
   guessedTrackIds: string[];
   loadTracks: () => Promise<void>;
-  addTrack: (file: File) => Promise<void>;
+  addTrack: (file: File) => Promise<AddTrackResult>;
   removeTrack: (trackId: string) => Promise<void>;
   clearTracks: () => Promise<void>;
   setState: (state: AppState) => void;
@@ -53,14 +58,16 @@ export const useStore = create<Store>((set) => ({
   
   addTrack: async (file: File) => {
     const trackName = file.name.replace(/\.[^/.]+$/, "");
-    const existingTracks = await getTracks();
-    if (existingTracks.some(t => t.name === trackName)) {
-      set({ state: 'ERROR', errorMessage: 'Этот трек уже есть в базе данных' });
-      return;
-    }
-
     set({ state: 'ANALYZING', errorMessage: null });
     try {
+      const existingTracks = await getTracks();
+      if (existingTracks.some(t => t.name === trackName)) {
+        const error = `Трек «${trackName}» уже есть в базе данных`;
+        set({ state: 'ERROR', errorMessage: error });
+        return { ok: false, error };
+      }
+
+      await validateAudioFileForImport(file);
       let buffer = await getAudioBuffer(file);
       if (buffer.sampleRate !== 22050) {
         console.log("Resampling file from", buffer.sampleRate, "to 22050");
@@ -72,7 +79,7 @@ export const useStore = create<Store>((set) => ({
       applyPreEmphasis(buffer);
       const peaks = await extractPeaks(buffer);
       const trackId = crypto.randomUUID();
-      const { hashArray, timeArray, peakCount, hashCount } = generateHashes(peaks, trackId);
+      const { hashArray, timeArray, peakCount } = generateHashes(peaks, trackId);
       
       const track: Track = {
         id: trackId,
@@ -82,14 +89,24 @@ export const useStore = create<Store>((set) => ({
         audioBlob: file
       };
       
-      await saveTrack(track);
       await saveHashesWorker(trackId, hashArray, timeArray);
+      try {
+        await saveTrack(track);
+      } catch (error) {
+        await removeHashesWorker(trackId).catch(() => undefined);
+        throw error;
+      }
       
       const tracks = await getTracks();
       set({ tracks, state: 'IDLE' });
+      return { ok: true };
     } catch (e) {
       console.error(e);
-      set({ state: 'ERROR', errorMessage: 'Не удалось проанализировать трек' });
+      const error = e instanceof AudioImportError
+        ? e.message
+        : `Не удалось проанализировать «${file.name}». Возможно, формат не поддерживается или в хранилище недостаточно места.`;
+      set({ state: 'ERROR', errorMessage: error });
+      return { ok: false, error };
     }
   },
 

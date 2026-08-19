@@ -1,32 +1,112 @@
 const TARGET_SAMPLE_RATE = 22050;
 const FFT_SIZE = 8192;
 const HOP_SIZE = 1024;
+const IOS_DECODE_MEMORY_BUDGET = 192 * 1024 * 1024;
+const IOS_MAX_COMPRESSED_FILE_SIZE = 96 * 1024 * 1024;
+
+export class AudioImportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AudioImportError';
+  }
+}
+
+function isIOSDevice() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+async function readAudioDuration(file: File): Promise<number | null> {
+  return new Promise(resolve => {
+    const audio = document.createElement('audio');
+    const objectUrl = URL.createObjectURL(file);
+    let settled = false;
+
+    const finish = (duration: number | null) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      audio.removeAttribute('src');
+      audio.load();
+      URL.revokeObjectURL(objectUrl);
+      resolve(duration);
+    };
+
+    const timeoutId = window.setTimeout(() => finish(null), 8000);
+    audio.preload = 'metadata';
+    audio.onloadedmetadata = () => {
+      const duration = Number.isFinite(audio.duration) && audio.duration > 0
+        ? audio.duration
+        : null;
+      finish(duration);
+    };
+    audio.onerror = () => finish(null);
+    audio.src = objectUrl;
+  });
+}
+
+/** Prevents iOS Safari from killing the tab before decodeAudioData can reject. */
+export async function validateAudioFileForImport(file: File) {
+  if (!isIOSDevice()) return;
+
+  if (file.size > IOS_MAX_COMPRESSED_FILE_SIZE) {
+    throw new AudioImportError(
+      `Файл «${file.name}» слишком большой для безопасного декодирования на iPhone. `
+      + 'Обрежьте файл до первой минуты — ClassiZam всё равно строит отпечаток только по первым 60 секундам.',
+    );
+  }
+
+  const duration = await readAudioDuration(file);
+  if (duration === null) return;
+
+  // Safari normally decodes music to stereo 48 kHz float PCM. Include the
+  // compressed source buffer because both can coexist during decodeAudioData.
+  const estimatedPeakBytes = duration * 48000 * 2 * Float32Array.BYTES_PER_ELEMENT + file.size;
+  if (estimatedPeakBytes > IOS_DECODE_MEMORY_BUDGET) {
+    const minutes = Math.max(1, Math.round(duration / 60));
+    throw new AudioImportError(
+      `Трек «${file.name}» длится около ${minutes} мин. Его полное декодирование может закрыть вкладку Safari. `
+      + 'Обрежьте файл до первой минуты: используемый для распознавания фрагмент от этого не изменится.',
+    );
+  }
+}
 
 export async function getAudioBuffer(file: File): Promise<AudioBuffer> {
   const ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
-  const arrayBuffer = await file.arrayBuffer();
-  const decodedBuffer = await ctx.decodeAudioData(arrayBuffer);
-  
-  const MAX_SECONDS = 60;
-  if (decodedBuffer.duration > MAX_SECONDS) {
-    const length = MAX_SECONDS * decodedBuffer.sampleRate;
-    const offlineCtx = new OfflineAudioContext(
-      decodedBuffer.numberOfChannels,
-      length,
-      decodedBuffer.sampleRate
-    );
-    const newBuffer = offlineCtx.createBuffer(
-      decodedBuffer.numberOfChannels,
-      length,
-      decodedBuffer.sampleRate
-    );
-    for (let c = 0; c < decodedBuffer.numberOfChannels; c++) {
-      newBuffer.copyToChannel(decodedBuffer.getChannelData(c).subarray(0, length), c);
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const decodedBuffer = await ctx.decodeAudioData(arrayBuffer);
+
+    const MAX_SECONDS = 60;
+    if (decodedBuffer.duration > MAX_SECONDS) {
+      const length = MAX_SECONDS * decodedBuffer.sampleRate;
+      const offlineCtx = new OfflineAudioContext(
+        decodedBuffer.numberOfChannels,
+        length,
+        decodedBuffer.sampleRate
+      );
+      const newBuffer = offlineCtx.createBuffer(
+        decodedBuffer.numberOfChannels,
+        length,
+        decodedBuffer.sampleRate
+      );
+      for (let c = 0; c < decodedBuffer.numberOfChannels; c++) {
+        newBuffer.copyToChannel(decodedBuffer.getChannelData(c).subarray(0, length), c);
+      }
+      return newBuffer;
     }
-    return newBuffer;
+
+    return decodedBuffer;
+  } catch (error) {
+    if (error instanceof AudioImportError) throw error;
+    throw new AudioImportError(
+      `Не удалось декодировать «${file.name}». На iPhone попробуйте MP3 или AAC без DRM либо перекодируйте файл.`,
+    );
+  } finally {
+    if (ctx.state !== 'closed') {
+      await ctx.close().catch(() => undefined);
+    }
   }
-  
-  return decodedBuffer;
 }
 
 export async function resampleAudio(audioBuffer: AudioBuffer, targetSampleRate: number): Promise<AudioBuffer> {

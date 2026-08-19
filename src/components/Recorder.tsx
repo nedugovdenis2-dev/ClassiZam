@@ -1,13 +1,23 @@
 import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { AudioRecorder } from '../services/recorder';
-import { extractPeaks, generateHashes, normalize, getRMS, resampleAudio, applyPreEmphasis } from '../services/fingerprint';
-import { matchHashes, preloadHashes } from '../services/matcher';
+import { matchHashes, preloadHashes, resetMatchWorker } from '../services/matcher';
 import { Mic, Square, Loader2, CheckCircle2, XCircle, HelpCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 export function Recorder() {
-  const { state, setState, setError, setMatch, setIntermediateMatch, volume, setVolume, matchedTrack, confidence, intermediateTrack, intermediateConfidence, errorMessage } = useStore();
+  const state = useStore(store => store.state);
+  const setState = useStore(store => store.setState);
+  const setError = useStore(store => store.setError);
+  const setMatch = useStore(store => store.setMatch);
+  const setIntermediateMatch = useStore(store => store.setIntermediateMatch);
+  const volume = useStore(store => store.volume);
+  const setVolume = useStore(store => store.setVolume);
+  const matchedTrack = useStore(store => store.matchedTrack);
+  const confidence = useStore(store => store.confidence);
+  const intermediateTrack = useStore(store => store.intermediateTrack);
+  const intermediateConfidence = useStore(store => store.intermediateConfidence);
+  const errorMessage = useStore(store => store.errorMessage);
   const recorderRef = useRef<AudioRecorder | null>(null);
   const [progress, setProgress] = useState(0);
   const [elapsedTime, setElapsedTime] = useState(0);
@@ -16,12 +26,17 @@ export function Recorder() {
   const bestConfidence = useRef<number>(0);
   const timerRef = useRef<number | null>(null);
   const isMatchingRef = useRef<boolean>(false);
+  const isRecordingRef = useRef<boolean>(false);
+  const recordingSessionRef = useRef(0);
+  const lastVolumeUpdateRef = useRef(0);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [isSilent, setIsSilent] = useState(false);
   const isSilentRef = useRef(false);
   const MAX_TIME = 40; // Increased to 40 seconds
   
   const startRecording = async () => {
+    const sessionId = ++recordingSessionRef.current;
+    isRecordingRef.current = false;
     setMatch(null, 0);
     setIntermediateMatch(null, 0);
     setProgress(0);
@@ -36,6 +51,7 @@ export function Recorder() {
     try {
       // Preload database into memory to prevent UI freeze during the first match
       await preloadHashes();
+      await resetMatchWorker();
     } catch (e) {
       console.error("Failed to load DB", e);
       setError("Не удалось загрузить базу данных");
@@ -48,14 +64,22 @@ export function Recorder() {
     let prev2 = new Float32Array(4096);
     let prev1 = new Float32Array(4096);
     
-    // We will accumulate peaks and periodically generate hashes
+    // Keep only hashes that the worker has not processed yet. The worker retains
+    // cumulative scores, so recognition results remain mathematically identical.
     let recentPeaks: { time: number, freqs: number[] }[] = [];
     let lastHashTime = 0;
-    const allHashes = new Map<number, number[]>();
+    let pendingHashes: number[] = [];
+    let pendingTimes: number[] = [];
     
     try {
+      isRecordingRef.current = true;
       await recorderRef.current.start((freqData, rms) => {
-        setVolume(Math.min(1, rms * 5)); // Scale RMS for UI
+        // Volume only drives UI animation; throttling it does not touch audio analysis.
+        const now = performance.now();
+        if (now - lastVolumeUpdateRef.current >= 66) {
+          lastVolumeUpdateRef.current = now;
+          setVolume(Math.min(1, rms * 5));
+        }
         
         if (frameNumber >= 2) {
           const freqs: number[] = [];
@@ -158,12 +182,8 @@ export function Recorder() {
                 const m1 = Math.min(f1, f2);
                 const m2 = Math.max(f1, f2);
                 const hash = m1 | (m2 << 12) | (0 << 24);
-                let list = allHashes.get(hash);
-                if (!list) {
-                  list = [];
-                  allHashes.set(hash, list);
-                }
-                list.push(Math.round(currentPeak.time));
+                pendingHashes.push(hash);
+                pendingTimes.push(Math.round(currentPeak.time));
               }
             }
             
@@ -177,12 +197,8 @@ export function Recorder() {
               for (const f1 of p1.freqs) {
                 for (const f2 of currentPeak.freqs) {
                   const hash = f1 | (f2 << 12) | (dt << 24);
-                  let list = allHashes.get(hash);
-                  if (!list) {
-                    list = [];
-                    allHashes.set(hash, list);
-                  }
-                  list.push(Math.round(p1.time));
+                  pendingHashes.push(hash);
+                  pendingTimes.push(Math.round(p1.time));
                 }
               }
             }
@@ -202,20 +218,15 @@ export function Recorder() {
         if (frameNumber - lastHashTime >= framesPerSecond) {
           lastHashTime = frameNumber;
           
-          if (allHashes.size > 0 && !isMatchingRef.current) {
+          if (pendingHashes.length > 0 && !isMatchingRef.current) {
               isMatchingRef.current = true;
-              const hashList: number[] = [];
-              const timeList: number[] = [];
-              for (const [hash, times] of allHashes.entries()) {
-                for (const t of times) {
-                  hashList.push(hash);
-                  timeList.push(t);
-                }
-              }
-              const queryHashArray = new Uint32Array(hashList);
-              const queryTimeArray = new Uint32Array(timeList);
+              const queryHashArray = new Uint32Array(pendingHashes);
+              const queryTimeArray = new Uint32Array(pendingTimes);
+              pendingHashes = [];
+              pendingTimes = [];
 
               matchHashes(queryHashArray, queryTimeArray).then(match => {
+              if (recordingSessionRef.current !== sessionId || !isRecordingRef.current) return;
               if (match) {
                 // match.matches is cumulative across the whole recording.
                 // We expect the number of matches to grow over time.
@@ -244,7 +255,9 @@ export function Recorder() {
             }).catch(err => {
               console.error("Worker match error:", err);
             }).finally(() => {
-              isMatchingRef.current = false;
+              if (recordingSessionRef.current === sessionId) {
+                isMatchingRef.current = false;
+              }
             });
           }
         }
@@ -261,6 +274,7 @@ export function Recorder() {
         }
       }, 1000);
     } catch (e) {
+      isRecordingRef.current = false;
       console.error("Microphone error:", e);
       setError("Требуется доступ к микрофону. Пожалуйста, разрешите использование микрофона.");
       stopRecording(true);
@@ -268,6 +282,8 @@ export function Recorder() {
   };
   
   const stopRecording = (autoStop: boolean) => {
+    isRecordingRef.current = false;
+    recordingSessionRef.current++;
     if (timerRef.current) clearInterval(timerRef.current);
     recorderRef.current?.stop();
     setVolume(0);
@@ -291,6 +307,8 @@ export function Recorder() {
   
   useEffect(() => {
     return () => {
+      isRecordingRef.current = false;
+      recordingSessionRef.current++;
       if (timerRef.current) clearInterval(timerRef.current);
       recorderRef.current?.stop();
     };

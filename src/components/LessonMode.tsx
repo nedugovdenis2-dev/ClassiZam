@@ -2,7 +2,9 @@ import { useStore } from '../store';
 import { CheckCircle2, Circle, RotateCcw, BookOpen } from 'lucide-react';
 
 export function LessonMode() {
-  const { tracks, guessedTrackIds, resetLesson } = useStore();
+  const tracks = useStore(store => store.tracks);
+  const guessedTrackIds = useStore(store => store.guessedTrackIds);
+  const resetLesson = useStore(store => store.resetLesson);
 
   const guessedCount = guessedTrackIds.length;
   const totalCount = tracks.length;
